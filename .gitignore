@@ -32,3 +32,7 @@ preview_out.txt
 # Never commit a key file.
 *.key
 .hoodsniper.key
+
+# RPC credentials
+.env
+*.env

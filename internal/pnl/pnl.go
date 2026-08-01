@@ -19,6 +19,8 @@ import (
 	"math/big"
 	"net/http"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -214,15 +216,25 @@ func FetchInternalETH(wallet common.Address, max int) (map[string]*big.Int, erro
 	return out, nil
 }
 
-// receiptBatchSize bounds one JSON-RPC batch. Large enough to amortise the
-// round trip, small enough that a public node will not reject the payload.
-const receiptBatchSize = 50
+// receiptBatchSize bounds one JSON-RPC batch.
+//
+// Providers meter compute units per second rather than requests:
+// eth_getTransactionReceipt costs ~15 CU, so fifty of them is ~750 CU against a
+// budget nearer 330 CU/s. Twenty keeps a single batch inside roughly one
+// second's allowance, which is what makes the pacing below workable.
+const receiptBatchSize = 20
+
+// batchPace is the minimum gap between batches, sized so sustained throughput
+// stays under the compute-unit budget. A burst of nine large batches succeeds
+// and then the next minute of work is rejected, so pacing beats retrying.
+const batchPace = 1200 * time.Millisecond
 
 // fetchReceipts retrieves receipts in batches, keyed by transaction hash.
 // Individual failures are skipped rather than aborting the wallet: one missing
 // receipt should cost one trade, not the whole measurement.
 func fetchReceipts(ctx context.Context, client *rpc.Client, txs []Tx) (map[string]receipt, error) {
 	out := make(map[string]receipt, len(txs))
+	failed := 0
 
 	for start := 0; start < len(txs); start += receiptBatchSize {
 		end := start + receiptBatchSize
@@ -240,7 +252,7 @@ func fetchReceipts(ctx context.Context, client *rpc.Client, txs []Tx) (map[strin
 				Result: &results[i],
 			}
 		}
-		if err := client.BatchCallContext(ctx, batch); err != nil {
+		if err := batchWithRetry(ctx, client, batch); err != nil {
 			// Swallowing this produced wallets scored as "0 trades" that were
 			// really "0 receipts fetched" — a measurement failure wearing the
 			// costume of a result. Surface it and stop, so a partial fetch can
@@ -250,12 +262,112 @@ func fetchReceipts(ctx context.Context, client *rpc.Client, txs []Tx) (map[strin
 		}
 		for i, e := range batch {
 			if e.Error != nil {
+				failed++
 				continue
 			}
 			out[chunk[i].Hash] = results[i]
 		}
 	}
+	// Per-element errors inside an otherwise-successful batch were previously
+	// skipped one by one, so a wholly failed fetch returned an empty map and no
+	// error — which downstream rendered as "0 trades" for a wallet with 425 of
+	// them. A wallet we could not measure must never look like one that did
+	// nothing.
+	if len(out) == 0 && len(txs) > 0 {
+		return out, fmt.Errorf("no receipts retrieved for %d transactions (%d rejected) "+
+			"— the endpoint is refusing the batch", len(txs), failed)
+	}
+	if failed > len(txs)/2 {
+		return out, fmt.Errorf("%d of %d receipts rejected — result would be partial",
+			failed, len(txs))
+	}
 	return out, nil
+}
+
+// batchGate serialises receipt batches across every worker.
+//
+// Providers limit compute units per second, not requests. Nine sequential
+// batches of fifty receipts complete in under a second; the same work split
+// across three workers is rejected outright. Parallelism belongs in the
+// explorer fetches and the decoding, not in hammering one rate-limited
+// endpoint from several goroutines at once.
+var (
+	batchGate sync.Mutex
+	lastBatch time.Time
+)
+
+// waitForSlot paces batches. The caller holds batchGate.
+func waitForSlot(ctx context.Context) error {
+	if gap := time.Since(lastBatch); gap < batchPace {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(batchPace - gap):
+		}
+	}
+	lastBatch = time.Now()
+	return nil
+}
+
+// batchWithRetry sends a batch, backing off on rate limits.
+//
+// Every provider throttles, including paid ones — Alchemy accepts nine
+// sequential batches happily and rejects the same work sent from several
+// workers at once. Treating a 429 as a fatal error discards a wallet we could
+// have measured a moment later; treating it as an empty result would be worse
+// still, since that reads as "this wallet did nothing".
+func batchWithRetry(ctx context.Context, client *rpc.Client, batch []rpc.BatchElem) error {
+	const maxAttempts = 6
+	delay := 400 * time.Millisecond
+
+	batchGate.Lock()
+	defer batchGate.Unlock()
+
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := waitForSlot(ctx); err != nil {
+			return err
+		}
+		err = client.BatchCallContext(ctx, batch)
+		if err == nil {
+			// A batch can also be throttled per element while the call itself
+			// succeeds, which is the shape that previously went unnoticed.
+			if !anyRateLimited(batch) {
+				return nil
+			}
+			err = fmt.Errorf("429 Too Many Requests")
+		} else if !isRateLimit(err) {
+			return err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return err
+}
+
+func anyRateLimited(batch []rpc.BatchElem) bool {
+	for _, e := range batch {
+		if e.Error != nil && isRateLimit(e.Error) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRateLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") || strings.Contains(s, "too many requests") ||
+		strings.Contains(s, "rate limit") || strings.Contains(s, "capacity")
 }
 
 // Measure reconstructs trades for a wallet from its transactions.
