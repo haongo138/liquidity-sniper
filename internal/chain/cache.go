@@ -118,8 +118,26 @@ func (c *Client) FetchState(ctx context.Context, cache *Cache, token common.Addr
 		return state, nil
 	}
 
-	// Always fresh: one call, and the only figure that moves trade to trade.
-	liq, err := c.wethBalance(ctx, profile.Pool.Address)
+	// Always fresh: the only figure that moves trade to trade.
+	//
+	// How to read it depends on the venue. V2 and V3 pools are real contracts
+	// with a WETH balance; a V4 pool is an entry inside the singleton whose
+	// Pool.Address is only a display slice of the poolId, so asking for its
+	// WETH balance returns zero and silently reports a 112 ETH pool as empty.
+	var (
+		liq *big.Int
+		err error
+	)
+	if profile.Pool.Venue == "uniswap-v4" {
+		liq, err = c.v4Depth(ctx, V4Pool{
+			ID:        profile.Pool.V4PoolID,
+			Currency0: profile.Pool.V4Currency0,
+			Currency1: profile.Pool.V4Currency1,
+			Fee:       profile.Pool.FeeTier,
+		})
+	} else {
+		liq, err = c.wethBalance(ctx, profile.Pool.Address)
+	}
 	if err != nil {
 		return state, err
 	}
@@ -128,6 +146,9 @@ func (c *Client) FetchState(ctx context.Context, cache *Cache, token common.Addr
 		Venue:         profile.Pool.Venue,
 		FeeTier:       profile.Pool.FeeTier,
 		WETHLiquidity: liq,
+		V4PoolID:      profile.Pool.V4PoolID,
+		V4Currency0:   profile.Pool.V4Currency0,
+		V4Currency1:   profile.Pool.V4Currency1,
 	}
 	return state, nil
 }

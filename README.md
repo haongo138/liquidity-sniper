@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8.svg?logo=go&logoColor=white)](go.mod)
 [![Chain 4663](https://img.shields.io/badge/chain-Robinhood%204663-1ce783.svg)](https://docs.robinhood.com/chain/connecting)
-[![Tests 46](https://img.shields.io/badge/tests-46%20passing-brightgreen.svg)](#verification)
+[![Tests 50](https://img.shields.io/badge/tests-50%20passing-brightgreen.svg)](#verification)
 [![Execution: not armed](https://img.shields.io/badge/execution-not%20armed-orange.svg)](#status)
 
 Copy-trades KOL wallets on Robinhood Chain (EVM, chain 4663) by tapping the
@@ -14,12 +14,12 @@ chain — see [SPEC.md](SPEC.md) for the evidence. The edge is over everyone els
 reacting via RPC, never over the wallet being copied.
 
 > [!WARNING]
-> **This is research tooling, not a trading system.** It has documented bugs that
-> produce wrong answers — the liquidity filter is blind to Uniswap V4 and rejects
-> valid tokens, and no wallet has yet been shown profitable enough to be worth
-> copying after the ~4% round-trip fee drag. Live execution is deliberately not
-> armed. Trading on-chain risks total loss of funds; nothing here is financial
-> advice, and the MIT licence's "AS IS, WITHOUT WARRANTY" applies in full.
+> **This is research tooling, not a trading system.** No wallet has yet been
+> shown profitable enough to be worth copying after the ~4% round-trip fee drag,
+> and wallet ranking is still noisy at achievable sample sizes. Live execution is
+> deliberately not armed. Trading on-chain risks total loss of funds; nothing
+> here is financial advice, and the MIT licence's "AS IS, WITHOUT WARRANTY"
+> applies in full.
 
 ## Status
 
@@ -176,7 +176,7 @@ reason in `shadow.jsonl`.
 | `token_blocklist` / `token_allowlist` | 0 | Free |
 | `allow_sells` | 0 | Direction gate |
 | `min_trade_eth` | 0 | Ignores dust from the watched wallet |
-| `min_liquidity_eth` / `max_liquidity_eth` | 1 | WETH side of the deepest pool |
+| `min_liquidity_eth` / `max_liquidity_eth` | 1 | ETH-side depth of the deepest pool across V2, V3 and V4 |
 | `require_lp_secured` + `min_lp_burned_pct` | 1 | **V2 only** — see below |
 | `require_renounced` | 1 | `owner() == 0x0` |
 
@@ -247,56 +247,44 @@ registry, measured at **1250–1500ms** versus ~250ms for a direct Uniswap decod
 The negative results are cached, so this improves as the cache warms, but it is
 another reason to co-locate.
 
-## KNOWN BUG: the liquidity filter is blind to Uniswap V4
+## Uniswap V4 support
 
-**`min_liquidity_eth` is unreliable for exactly the flow this tool targets.** Do
-not trust its verdicts, and do not arm execution until this is fixed.
+V4 is a **singleton**: every pool lives inside one PoolManager, so there is no
+per-pool address and `WETH.balanceOf(pool)` — the measure used for V2 and V3 —
+is meaningless. Ignoring that made the filter gate on whichever dormant V3 dust
+pool happened to exist. One token was rejected fifteen times at a fixed
+**0.2200 ETH** while its real V4 depth was **112.4220 ETH**, a 511x error, and
+tokens with *no* V2/V3 pool at all were invisible entirely.
 
-`findDeepestPool` locates pools by asking the V2 and V3 factories for a pool
-address, then reading `WETH.balanceOf(pool)`. **That approach cannot work for
-V4**, which is a *singleton*: every pool lives inside the one PoolManager
-contract, so there is no per-pool address whose balance means anything.
+Two measured facts made it tractable:
 
-Caught in a live shadow run. Token `0xaF3D76f1…` was rejected ~15 times over
-~180 blocks with liquidity pinned at 0.2200 ETH while wallets actively traded
-it. Liquidity that never moves under active trading is not liquidity being
-traded. Checking directly:
+1. **V4 denominates native ETH as `address(0)`, not WETH.** Discovery that looks
+   for WETH pairs finds nothing — which is why V4 pools were invisible.
+2. **The PoolManager emits `Initialize` with the poolId as its first indexed
+   topic.** Reconstructing the poolId by hashing a guessed PoolKey failed (every
+   storage read returned zero); reading it from the event cannot.
 
-| Venue | Depth |
-|---|---|
-| V2 pair | none |
-| V3 fee=500 pool | **0.2186 WETH** — dormant dust, what the filter measured |
-| V4 PoolManager | **1,433.93 tokens + 1,074.06 WETH** (aggregate) — where trading happens |
+Depth then comes from the pool's stored liquidity and price. The storage slot
+was found by scanning against a poolId taken from a live `Swap` event until the
+value matched that event's own `liquidity` field — slot 6, offset 3 — rather
+than assumed. Since V4 holds concentrated liquidity there is no single reserve,
+so depth is the virtual reserve at the current price:
 
-So the filter gated on an abandoned dust pool and rejected every trade. These
-are **false rejections**, and the bot routers route into V4, so this hits the
-majority of the flow the tool is aimed at.
+```
+ETH is currency0:  amount0 = L · 2^96 / sqrtPriceX96
+ETH is currency1:  amount1 = L · sqrtPriceX96 / 2^96
+```
 
-### Why the obvious fix was rejected
+Treat it as an order of magnitude, not an exact figure: it overstates depth for
+a range ending near the current tick and understates a wide one. A pool with no
+active liquidity at the current price reports **zero depth** rather than "no
+pool found" — it should be rejected as thin, not as unseeable.
 
-Reading V4 per-pool state means reconstructing
-`poolId = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks))`
-and `extsload`-ing the PoolManager. I tried it against a PoolKey taken from a
-real transaction and scanned mapping slots 0–15: every read returned zero, so
-either the PoolKey or the storage layout is wrong. Both would be guesses layered
-on the already-heuristic bot-router decode, and a wrong guess fails silently as
-a plausible-looking number.
+Verify against mainnet:
 
-### The fix worth building instead
-
-**Simulate the trade with `eth_call` rather than measuring a pool.** Ask the
-router what a sell of our intended size actually returns. This is:
-
-- **Venue-agnostic** — works for V2, V3, V4 and the bot routers, with no pool
-  discovery, no storage layout, and no PoolKey reconstruction.
-- **The number that actually matters** — "what would I get out" rather than
-  "how much is nominally in there".
-- **A honeypot check for free** — a sell simulation that reverts is a token you
-  cannot exit, which is the single most valuable filter and is currently not
-  implemented at all.
-
-Cost is one `eth_call`, replacing the current balance read. It subsumes
-`min_liquidity`, honeypot detection and tax measurement in one call.
+```bash
+V4_LIVE=1 go test ./internal/chain -run TestV4 -v
+```
 
 ## Known risks
 
@@ -316,7 +304,7 @@ Cost is one `eth_call`, replacing the current balance read. It subsumes
 ```bash
 go build ./...
 go vet ./...
-go test -race ./...        # 46 tests
+go test -race ./...        # 50 tests
 ```
 
 Coverage is weighted toward the things that fail silently:

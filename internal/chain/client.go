@@ -17,7 +17,6 @@ var (
 	selDecimals    = "0x313ce567" // decimals()
 	selGetPairV2   = "0xe6a43905" // getPair(address,address)
 	selGetPoolV3   = "0x1698ee82" // getPool(address,address,uint24)
-	selGetReserves = "0x0902f1ac" // getReserves()
 	selOwner       = "0x8da5cb5b" // owner()
 )
 
@@ -45,15 +44,30 @@ func (c *Client) Close() { c.rpc.Close() }
 
 // Pool describes where a token's liquidity lives.
 type Pool struct {
+	// Address is the pool contract for V2 and V3. V4 has no per-pool contract,
+	// so this holds the low 20 bytes of the poolId purely for display; use
+	// V4PoolID for anything real.
 	Address common.Address
-	// Venue is "uniswap-v2" or "uniswap-v3".
+	// Venue is "uniswap-v2", "uniswap-v3" or "uniswap-v4".
 	Venue string
-	// FeeTier is the V3 fee in hundredths of a bip; zero for V2.
+	// FeeTier is the fee in hundredths of a bip; zero for V2.
 	FeeTier uint32
-	// WETHLiquidity is the WETH side of the pool, in wei. This is the number
-	// the min-liquidity filter actually gates on: it is what you could sell
+	// WETHLiquidity is the ETH-side depth of the pool, in wei. This is the
+	// number the min-liquidity filter gates on: what could actually be sold
 	// into, regardless of what the token side claims to be worth.
+	//
+	// For V2 and V3 it is the pool's WETH balance. For V4 — a singleton with no
+	// per-pool balance — it is the virtual reserve derived from the pool's
+	// liquidity and current price. See internal/chain/v4.go.
 	WETHLiquidity *big.Int
+	// V4PoolID identifies the pool inside the singleton PoolManager. Zero for
+	// V2 and V3.
+	V4PoolID common.Hash
+	// V4Currency0 and V4Currency1 are the pool's ordered currencies. They are
+	// carried because the depth formula depends on which side holds ETH, and
+	// re-reading depth from a cached profile must not have to rediscover them.
+	V4Currency0 common.Address
+	V4Currency1 common.Address
 }
 
 // TokenState is an immutable snapshot of everything the filters need.
@@ -171,31 +185,76 @@ func (c *Client) findDeepestPool(ctx context.Context, token common.Address) (*Po
 			cands = append(cands, candidate{a, "uniswap-v3", fee})
 		}
 	}
-	if len(cands) == 0 {
-		return nil, nil
-	}
-
-	// The WETH balance of the pool contract is the honest depth measure for
-	// both venues: it is what is actually there to sell into.
-	balCalls := make([]rpc.BatchElem, len(cands))
-	for i, cd := range cands {
-		balCalls[i] = callElem(WETH, selBalanceOf+padAddr(cd.addr))
-	}
-	if err := c.rpc.BatchCallContext(ctx, balCalls); err != nil {
-		return nil, err
-	}
-
+	// No early return when cands is empty: a token whose only liquidity is in
+	// V4 has no V2 pair and no V3 pool, and returning here would make exactly
+	// the case this code exists for invisible again.
 	var best *Pool
-	for i, cd := range cands {
-		bal := resultBig(balCalls[i])
-		if bal == nil {
-			continue
+	if len(cands) > 0 {
+		// The WETH balance of the pool contract is the honest depth measure for
+		// both venues: it is what is actually there to sell into.
+		balCalls := make([]rpc.BatchElem, len(cands))
+		for i, cd := range cands {
+			balCalls[i] = callElem(WETH, selBalanceOf+padAddr(cd.addr))
 		}
-		if best == nil || bal.Cmp(best.WETHLiquidity) > 0 {
-			best = &Pool{Address: cd.addr, Venue: cd.venue, FeeTier: cd.fee, WETHLiquidity: bal}
+		if err := c.rpc.BatchCallContext(ctx, balCalls); err != nil {
+			return nil, err
+		}
+		for i, cd := range cands {
+			bal := resultBig(balCalls[i])
+			if bal == nil {
+				continue
+			}
+			if best == nil || bal.Cmp(best.WETHLiquidity) > 0 {
+				best = &Pool{Address: cd.addr, Venue: cd.venue, FeeTier: cd.fee, WETHLiquidity: bal}
+			}
+		}
+	}
+
+	// V4 is a singleton, so it cannot be discovered by asking a factory for a
+	// pool address. Skipping it made the filter measure a dormant V3 dust pool
+	// while the real liquidity sat in the PoolManager — see internal/chain/v4.go.
+	if v4 := c.deepestV4Pool(ctx, token); v4 != nil {
+		if best == nil || v4.WETHLiquidity.Cmp(best.WETHLiquidity) > 0 {
+			best = v4
 		}
 	}
 	return best, nil
+}
+
+// deepestV4Pool returns the deepest V4 pool for a token, or nil.
+//
+// Errors are swallowed deliberately: V4 is additive here, so a failed lookup
+// should leave the V2/V3 answer standing rather than fail the whole read. It
+// cannot mask a problem, because a V4-only token still ends up with no pool at
+// all and is rejected on that basis.
+func (c *Client) deepestV4Pool(ctx context.Context, token common.Address) *Pool {
+	pools, err := c.findV4Pools(ctx, token)
+	if err != nil || len(pools) == 0 {
+		return nil
+	}
+	var best *Pool
+	for _, p := range pools {
+		depth, err := c.v4Depth(ctx, p)
+		if err != nil || depth == nil {
+			continue
+		}
+		// A zero-depth pool is still returned. Concentrated liquidity can leave
+		// a pool with no active liquidity at the current price, and that must be
+		// rejected as thin — not reported as "no pool found on any venue", which
+		// would wrongly suggest the token could not be seen at all.
+		if best == nil || depth.Cmp(best.WETHLiquidity) > 0 {
+			best = &Pool{
+				Address:       common.BytesToAddress(p.ID.Bytes()[12:]),
+				Venue:         "uniswap-v4",
+				FeeTier:       p.Fee,
+				WETHLiquidity: depth,
+				V4PoolID:      p.ID,
+				V4Currency0:   p.Currency0,
+				V4Currency1:   p.Currency1,
+			}
+		}
+	}
+	return best
 }
 
 // callElem builds one eth_call batch element against "latest".

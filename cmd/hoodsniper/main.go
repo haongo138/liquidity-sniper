@@ -282,7 +282,7 @@ func cacheStats(c *chain.Cache) (int, int) { return c.Stats() }
 
 // monitorConfig flattens the loaded config for the TUI's Config view. The
 // filter notes carry the caveats that matter at a glance — chiefly that
-// "LP burnt or locked" cannot be evaluated on V3 at all.
+// "LP burnt or locked" cannot be evaluated on V3 or V4 at all.
 func monitorConfig(path, ledger string, c config.Config) monitor.Config {
 	f := c.Filters
 	return monitor.Config{
@@ -290,10 +290,10 @@ func monitorConfig(path, ledger string, c config.Config) monitor.Config {
 		Watch: c.Watch, TradeSizeETH: c.TradeSizeETH, LedgerPath: ledger,
 		Filters: []monitor.ConfigRow{
 			{Name: "min_liquidity_eth", Value: fmt.Sprintf("%g", f.MinLiquidityETH),
-				Note: "blind to V4 — see README KNOWN BUG"},
+				Note: "deepest pool across V2/V3/V4"},
 			{Name: "max_liquidity_eth", Value: fmt.Sprintf("%g", f.MaxLiquidityETH)},
 			{Name: "require_lp_secured", Value: fmt.Sprintf("%t", f.RequireLPSecured),
-				Note: "V2 only; reports n/a on V3"},
+				Note: "V2 only; n/a on V3 and V4"},
 			{Name: "min_lp_burned_pct", Value: fmt.Sprintf("%g", f.MinLPBurnedPct)},
 			{Name: "require_renounced", Value: fmt.Sprintf("%t", f.RequireRenounced)},
 			{Name: "min_trade_eth", Value: fmt.Sprintf("%g", f.MinTradeETH),
