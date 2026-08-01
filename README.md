@@ -1,11 +1,25 @@
 # hoodsniper
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8.svg?logo=go&logoColor=white)](go.mod)
+[![Chain 4663](https://img.shields.io/badge/chain-Robinhood%204663-1ce783.svg)](https://docs.robinhood.com/chain/connecting)
+[![Tests 46](https://img.shields.io/badge/tests-46%20passing-brightgreen.svg)](#verification)
+[![Execution: not armed](https://img.shields.io/badge/execution-not%20armed-orange.svg)](#status)
+
 Copy-trades KOL wallets on Robinhood Chain (EVM, chain 4663) by tapping the
 sequencer feed directly.
 
 **It is a backrunner, not a front-runner.** Front-running is impossible on this
 chain — see [SPEC.md](SPEC.md) for the evidence. The edge is over everyone else
 reacting via RPC, never over the wallet being copied.
+
+> [!WARNING]
+> **This is research tooling, not a trading system.** It has documented bugs that
+> produce wrong answers — the liquidity filter is blind to Uniswap V4 and rejects
+> valid tokens, and no wallet has yet been shown profitable enough to be worth
+> copying after the ~4% round-trip fee drag. Live execution is deliberately not
+> armed. Trading on-chain risks total loss of funds; nothing here is financial
+> advice, and the MIT licence's "AS IS, WITHOUT WARRANTY" applies in full.
 
 ## Status
 
@@ -65,10 +79,6 @@ Two deliberate limits. Config is **read-only**: a file that gates money should
 not be editable by a stray keystroke. And wallet scoring is on-demand rather
 than automatic, because it costs a receipt per trade and will hit `429` on a
 public node — counting the ledger is local and instant, so that happens on open.
-
-It needs an interactive terminal; piping or redirecting output fails with a
-message telling you to drop the flag. Logs go to `hoodsniper.log` in TUI mode
-rather than stdout, since writing to the screen would corrupt the frame.
 
 It needs an interactive terminal; piping or redirecting output fails with a
 message telling you to drop the flag. Logs go to `hoodsniper.log` in TUI mode
@@ -300,3 +310,36 @@ Cost is one `eth_call`, replacing the current balance read. It subsumes
    in the UK, Canada, Switzerland, the UAE). This tool targets permissionless
    ERC-20s, so the restriction is informational.
 4. **Public endpoints are rate-limited** and documented as not for production.
+
+## Verification
+
+```bash
+go build ./...
+go vet ./...
+go test -race ./...        # 46 tests
+```
+
+Coverage is weighted toward the things that fail silently:
+
+- **Wire decoder** — round-trips real signed transactions through the Nitro
+  batch format, including corrupt-segment skipping and the `signatureV2` field
+  name that makes a signed feed look unsigned if misread.
+- **Calldata decoding** — cross-validated against go-ethereum's own ABI encoder,
+  plus hostile inputs (truncated bodies, out-of-range offsets) that must error
+  rather than panic. Calldata is attacker-controlled.
+- **Bot router heuristic** — a golden test built from a real mainnet transaction
+  whose receipt confirms the decoded amount.
+- **Filters** — that `n/a` never masquerades as a pass, since an unrunnable check
+  is not a passed check.
+- **TUI** — every tab rendered through the real `View()` at four terminal widths.
+  Render the frames yourself without a terminal:
+  ```bash
+  go test -c -o /tmp/montest ./internal/monitor
+  PREVIEW=1 /tmp/montest -test.run TestPreview -test.v
+  ```
+
+There is no CI, so no build badge — one would assert a check that nobody runs.
+
+## Licence
+
+[MIT](LICENSE) © 2026 haongo138
