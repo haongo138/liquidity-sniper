@@ -1,0 +1,30 @@
+# Collected data. ledger.jsonl reached 82 MB in three hours and grows at
+# roughly 38 MB/hour — it is regenerable with cmd/collect and does not belong
+# in git.
+ledger.jsonl
+*.jsonl
+
+# Run logs
+*.log
+
+# Local run configs. hoodsniper.yaml is the committed example; copies made for
+# a particular run are not.
+kol.yaml
+validate.yaml
+my.yaml
+
+# Build output
+/hoodsniper
+/collect
+/scout
+/pnl
+/feedtap
+preview_out.txt
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude Code settings
+.claude/settings.local.json

@@ -1,0 +1,66 @@
+# hoodsniper — Phase 1 shadow-mode configuration.
+#
+# Nothing here signs a transaction. `live: true` is rejected until Phase 2.
+
+feed: mainnet          # "mainnet", "testnet", or ws://127.0.0.1:9642 for the local relay
+rpc: https://rpc.mainnet.chain.robinhood.com
+chain_id: 4663
+
+# Wallets selected by MEASURED PROFITABILITY, not activity.
+#
+# The three wallets originally chosen for being busy all lost money: the best
+# managed -4.45%, another went 0-for-4 on round trips. They were removed. Copying
+# a loser just converts their loss into a larger one, because a copier pays ~4%
+# per round trip in fees before any slippage.
+#
+# These came from `go run ./cmd/scout`, ranked on complete round trips only
+# (both legs inside the observed window). Figures as of 2026-08-01.
+#
+# CAVEAT: 5-6 round trips each is a small sample and a short window flatters a
+# lucky wallet. Re-run cmd/pnl on these before trusting them with real size.
+# RE-MEASUREMENT WARNING — only 1 of 4 shortlisted wallets survived a second
+# pass. Scores are NOT stable at this sample size:
+#
+#   0x8F5537Bb  scout +67.7% / 80% win  ->  remeasure -19.4% / 40% win  (SIGN FLIP)
+#   0x5638484b  scout +40.1% / 67% win  ->  remeasure +289%  / 33% win  (one lucky trade)
+#   0x3c86D511  scout +38.6% / 67% win  ->  remeasure  +56.0% / 60% win (held)
+#   0xD96304E3  scout  +6.7% / 60% win  ->  only 2 round trips (below sample floor)
+#
+# Two causes, both real. Adding internal-ETH traces made previously-invisible
+# positions measurable, and they were losses — so the earlier scores were biased
+# upward by silently dropping the worst positions. And 2-6 round trips simply
+# cannot separate skill from luck; one trade dominates the average.
+#
+# Treat this list as UNVALIDATED. Do not size up on it.
+watch:
+  # The only wallet that held across both measurements: +38.6% then +56.0%,
+  # 60-67% win rate. Still just 5-6 round trips.
+  - "0x3c86D511803AfB9b7478A15527274f9B464bab89"
+
+# What we would spend per copied buy.
+trade_size_eth: 0.01
+
+filters:
+  # Gates on the WETH side of the pool — what you could actually sell into.
+  min_liquidity_eth: 1.0
+  # Skip pools so deep a copy trade cannot move them.
+  max_liquidity_eth: 0
+  # V2 only. Reports "n/a" on V3, where liquidity is position NFTs and there
+  # is no fungible LP token to burn.
+  require_lp_secured: true
+  min_lp_burned_pct: 90.0
+  # Most live tokens keep an owner; leave off unless you want only renounced ones.
+  require_renounced: false
+  # Ignore dust from the watched wallet.
+  min_trade_eth: 0.0005
+  # Copy exits as well as entries.
+  allow_sells: false
+  token_blocklist: []
+  token_allowlist: []
+
+shadow_log: shadow.jsonl
+live: false
+
+# Enforced only when live is true, and validated at startup.
+max_trade_eth: 0.05
+daily_loss_limit_eth: 0.25

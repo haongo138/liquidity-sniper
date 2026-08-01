@@ -1,0 +1,31 @@
+# Offchain Labs' official Nitro relay: one upstream connection to Robinhood's
+# sequencer feed, re-served locally to as many consumers as you like.
+#
+# You want this because Robinhood rate-limits per CLIENT, not per connection —
+# opening five sockets yourself splits one budget five ways. It costs ~23MB of
+# memory and ~1.6% of a core, and writes nothing to disk.
+#
+# What it does NOT do: verify anything. A relay has no L1 connection, so it
+# cannot resolve the batch posters and `relay.go` passes nil for the address
+# verifier. Signature checking is the consumer's job.
+#
+#   docker compose up -d --wait relay
+#   go run ./cmd/feedtap --feed ws://127.0.0.1:9642 --rpc https://...
+
+services:
+  relay:
+    image: offchainlabs/nitro-node:latest
+    entrypoint: /usr/local/bin/relay
+    command:
+      - --node.feed.input.url=wss://feed.mainnet.chain.robinhood.com
+      - --node.feed.output.addr=0.0.0.0
+      - --node.feed.output.port=9642
+      - --chain.id=4663
+    ports:
+      - "127.0.0.1:9642:9642"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /proc/1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
