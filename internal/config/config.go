@@ -11,9 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/antono/hoodsniper/internal/exec"
 	"github.com/antono/hoodsniper/internal/filter"
 	"github.com/antono/hoodsniper/internal/holdtime"
 	"github.com/antono/hoodsniper/internal/ladder"
+	"github.com/antono/hoodsniper/internal/position"
 	"github.com/ethereum/go-ethereum/common"
 	"gopkg.in/yaml.v3"
 )
@@ -44,6 +46,24 @@ type Config struct {
 	MaxTradeETH float64 `yaml:"max_trade_eth"`
 	// DailyLossLimitETH trips the kill switch.
 	DailyLossLimitETH float64 `yaml:"daily_loss_limit_eth"`
+
+	// DryRun builds, signs and simulates every trade but never broadcasts.
+	// It defaults to true whenever Live is set, so arming execution does not
+	// spend money until that default is explicitly overridden.
+	DryRun *bool `yaml:"dry_run"`
+	// SlippageBps is our own floor. Never taken from the wallet being copied,
+	// which routinely sends zero.
+	SlippageBps int64 `yaml:"slippage_bps"`
+
+	Exits ExitConfig `yaml:"exits"`
+}
+
+// ExitConfig configures when to close a position.
+type ExitConfig struct {
+	TakeProfitPct float64 `yaml:"take_profit_pct"`
+	StopLossPct   float64 `yaml:"stop_loss_pct"`
+	MaxHoldSecs   int     `yaml:"max_hold_seconds"`
+	FollowKOLSell *bool   `yaml:"follow_kol_sell"`
 }
 
 // FilterConfig mirrors the filter thresholds in YAML-friendly units.
@@ -106,6 +126,12 @@ func (c *Config) validate() error {
 	if c.TradeSizeETH <= 0 {
 		return fmt.Errorf("trade_size_eth must be positive")
 	}
+	if c.SlippageBps < 0 || c.SlippageBps >= 10000 {
+		return fmt.Errorf("slippage_bps must be within 0..9999")
+	}
+	if c.Exits.TakeProfitPct < 0 || c.Exits.StopLossPct < 0 || c.Exits.MaxHoldSecs < 0 {
+		return fmt.Errorf("exit thresholds cannot be negative")
+	}
 	// The ceiling exists to bound a bug, so it must be set whenever real money
 	// is at stake and must actually bind.
 	if c.Live {
@@ -118,6 +144,14 @@ func (c *Config) validate() error {
 		}
 		if c.DailyLossLimitETH <= 0 {
 			return fmt.Errorf("daily_loss_limit_eth must be set when live is true")
+		}
+		// An armed bot with every exit disabled can open positions it will
+		// never close. Refuse rather than let that be a typo.
+		if !c.IsDryRun() && c.Exits.TakeProfitPct == 0 && c.Exits.StopLossPct == 0 &&
+			c.Exits.MaxHoldSecs == 0 && !c.ExitRules().FollowKOLSell {
+			return fmt.Errorf("live execution requires at least one exit trigger: " +
+				"set exits.take_profit_pct, stop_loss_pct, max_hold_seconds, " +
+				"or leave follow_kol_sell on")
 		}
 	}
 	if c.Filters.MinHoldRatio < 0 {
@@ -220,4 +254,44 @@ func (c Config) HoldGate() (ratio float64, samples int) {
 		samples = holdtime.DefaultMinSamples
 	}
 	return ratio, samples
+}
+
+// IsDryRun reports whether trades are simulated but never broadcast.
+//
+// Absent means true. Arming execution should not start spending on the strength
+// of an unset field; turning that off has to be written down.
+func (c Config) IsDryRun() bool {
+	if c.DryRun == nil {
+		return true
+	}
+	return *c.DryRun
+}
+
+// ExitRules builds the exit configuration, filling unset values with the
+// conservative defaults.
+func (c Config) ExitRules() position.Rules {
+	r := position.DefaultRules()
+	if c.Exits.TakeProfitPct > 0 {
+		r.TakeProfitPct = c.Exits.TakeProfitPct
+	}
+	if c.Exits.StopLossPct > 0 {
+		r.StopLossPct = c.Exits.StopLossPct
+	}
+	if c.Exits.MaxHoldSecs > 0 {
+		r.MaxHold = time.Duration(c.Exits.MaxHoldSecs) * time.Second
+	}
+	if c.Exits.FollowKOLSell != nil {
+		r.FollowKOLSell = *c.Exits.FollowKOLSell
+	}
+	return r
+}
+
+// ExecConfig builds the executor configuration.
+func (c Config) ExecConfig() exec.Config {
+	return exec.Config{
+		DryRun:            c.IsDryRun(),
+		SlippageBps:       c.SlippageBps,
+		MaxTradeWei:       ethToWei(c.MaxTradeETH),
+		DailyLossLimitWei: ethToWei(c.DailyLossLimitETH),
+	}
 }

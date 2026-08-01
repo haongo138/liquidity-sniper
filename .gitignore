@@ -28,3 +28,7 @@ preview_out.txt
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# Never commit a key file.
+*.key
+.hoodsniper.key

@@ -3,8 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8.svg?logo=go&logoColor=white)](go.mod)
 [![Chain 4663](https://img.shields.io/badge/chain-Robinhood%204663-1ce783.svg)](https://docs.robinhood.com/chain/connecting)
-[![Tests 73](https://img.shields.io/badge/tests-73%20passing-brightgreen.svg)](#verification)
-[![Execution: not armed](https://img.shields.io/badge/execution-not%20armed-orange.svg)](#status)
+[![Tests 110](https://img.shields.io/badge/tests-110%20passing-brightgreen.svg)](#verification)
+[![Execution: dry-run](https://img.shields.io/badge/execution-dry--run%20default-orange.svg)](#execution)
 
 Copy-trades KOL wallets on Robinhood Chain (EVM, chain 4663) by tapping the
 sequencer feed directly.
@@ -14,7 +14,9 @@ chain — see [SPEC.md](SPEC.md) for the evidence. The edge is over everyone els
 reacting via RPC, never over the wallet being copied.
 
 > [!WARNING]
-> **This is research tooling, not a trading system.** No wallet has yet been
+> **Execution is built but unproven — no transaction has ever been sent.** It
+> defaults to dry run, and turning that off should follow a dry run you have read.
+> No wallet has yet been
 > shown profitable enough to be worth copying after the ~4% round-trip fee drag,
 > and wallet ranking is still noisy at achievable sample sizes. Live execution is
 > deliberately not armed. Trading on-chain risks total loss of funds; nothing
@@ -27,12 +29,16 @@ reacting via RPC, never over the wallet being copied.
 |---|---|
 | 0 — Feed tap + latency gate | **Done.** Gate passed, see [PHASE0-RESULTS.md](PHASE0-RESULTS.md) |
 | 1 — Decode + filters + shadow mode | **Done.** Verified against live mainnet |
-| 2 — Live execution | **Not armed.** `live: true` is rejected at startup |
-| 3 — Dashboard | Not started |
-| 4 — Exit strategy | Not started |
+| 2 — Live execution | **Built, dry-run by default.** Never validated against a real trade |
+| 3 — Dashboard | **Done.** Five-tab TUI |
+| 4 — Exit strategy | **Done.** Ships with execution, not after |
 
-Phase 2 is deliberately not built yet: a bot that can buy but has no exit logic
-(Phase 4) is worse than no bot. Those two land together or not at all.
+Phases 2 and 4 landed together, as promised: a bot that can buy but has no exit
+logic is worse than no bot.
+
+**No transaction has ever been sent by this code.** It is built, unit-tested and
+its guards are verified, but it has never traded — not on mainnet, not on
+testnet. Treat the first real run as the test it is.
 
 ## Quick start
 
@@ -249,6 +255,63 @@ registry, measured at **1250–1500ms** versus ~250ms for a direct Uniswap decod
 The negative results are cached, so this improves as the cache warms, but it is
 another reason to co-locate.
 
+## Execution
+
+Armed with `live: true` **and** a key in the environment. Missing either falls
+back to shadow — loudly, and never silently the other way.
+
+```bash
+# The key never goes in the YAML. A 0600 file is preferred to an env var,
+# which anything that can read /proc or run `ps e` can see.
+echo -n "<hex key>" > ~/.hoodsniper.key && chmod 600 ~/.hoodsniper.key
+export HOODSNIPER_PRIVATE_KEY_FILE=~/.hoodsniper.key
+
+go run ./cmd/hoodsniper --config my.yaml     # dry_run defaults to true
+```
+
+Startup prints exactly what is armed:
+
+```
+execution armed  mode="DRY RUN — trades simulated and signed, never broadcast"
+  address=0xd400… chain_id=46630 max_trade_eth=0.05 daily_loss_limit_eth=0.25
+  take_profit_pct=50 stop_loss_pct=30 max_hold=10m0s follow_kol_sell=true
+```
+
+**Every trade is simulated with `eth_call` before it is signed.** A simulation
+that reverts is not sent. That costs one round trip and catches honeypots, dead
+slippage floors and encoding bugs before any gas is spent.
+
+Four refusals, each closing a way to lose money quietly:
+
+| Refusal | Why |
+|---|---|
+| Slippage is never zero | The copied wallets send `amountOutMinimum=0` and bet on speed. We arrive **after** them by design, so copying that hands a free option to whoever is in between. Bad config falls back to 5%, never to none. |
+| V4 tokens are not traded | Their depth is now measured correctly, but V4 encoding goes through UniversalRouter's command buffer and is not implemented. Refusing is honest; mis-encoding is not. |
+| `dry_run` defaults to **true** | Arming should not start spending on the strength of an unset field. |
+| Live requires an exit trigger | Config load fails if take-profit, stop-loss, max-hold and follow-KOL-sell are all off. That combination opens positions it can never close. |
+
+Plus a per-trade ceiling, a daily-loss kill switch that is **one-way** for the
+process lifetime (a later profit does not re-arm it — that should be a human
+decision), and a shutdown warning if positions are still open.
+
+### Exits
+
+Four independent triggers, because each covers a failure the others miss:
+
+- **The wallet sells** — they know something we do not; the observed pattern is
+  a de-risk sell that recovers the stake.
+- **Take profit** — the wallet may never sell, or may sell where we cannot see.
+- **Stop loss** — the wallet may be wrong, or we entered far worse than they did,
+  which is structural for a backrunner.
+- **Max hold** — covers the case none of the above fire: a token that stops
+  trading, a wallet that goes quiet, a position held forever.
+
+Price and time triggers run on their own 15s clock, because they fire when
+nothing is happening — exactly when no feed event would wake them. Positions are
+valued by **simulating the sell**, which accounts for fee-on-transfer and range
+effects that a price calculation misses; a quote that reverts is a honeypot
+signal, and max-hold still rescues the position.
+
 ## Hold-time gate
 
 Copying a wallet you are structurally too slow to follow is a **guaranteed**
@@ -379,7 +442,7 @@ V4_LIVE=1 go test ./internal/chain -run TestV4 -v
 ```bash
 go build ./...
 go vet ./...
-go test -race ./...        # 73 tests
+go test -race ./...        # 110 tests
 ```
 
 Coverage is weighted toward the things that fail silently:

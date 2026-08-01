@@ -69,8 +69,28 @@ filters:
   token_allowlist: []
 
 shadow_log: shadow.jsonl
+
+# ─── Execution ───────────────────────────────────────────────────────────────
+# live: false        → shadow. Nothing is signed. This is the default.
+# live: true         → arms execution. Requires a key in HOODSNIPER_PRIVATE_KEY_FILE
+#                      (0600) or HOODSNIPER_PRIVATE_KEY. NEVER put a key in this file.
+# dry_run            → absent means TRUE. Trades are built, signed and simulated
+#                      but never broadcast. Set false only after a dry run looks right.
 live: false
+dry_run: true
+
+# Our own slippage floor. The copied wallets send 0 and rely on speed; we land
+# behind them by design, so an unprotected order gives away a free option.
+slippage_bps: 500
 
 # Enforced only when live is true, and validated at startup.
 max_trade_eth: 0.05
 daily_loss_limit_eth: 0.25
+
+# At least one exit trigger is required when live and not dry-running: a bot
+# that can buy but not sell converts a losing trade into a permanent one.
+exits:
+  take_profit_pct: 50
+  stop_loss_pct: 30
+  max_hold_seconds: 600
+  follow_kol_sell: true

@@ -27,14 +27,18 @@ import (
 	"github.com/antono/hoodsniper/internal/chain"
 	"github.com/antono/hoodsniper/internal/config"
 	"github.com/antono/hoodsniper/internal/decode"
+	"github.com/antono/hoodsniper/internal/exec"
 	"github.com/antono/hoodsniper/internal/feed"
 	"github.com/antono/hoodsniper/internal/filter"
 	"github.com/antono/hoodsniper/internal/holdtime"
 	"github.com/antono/hoodsniper/internal/ladder"
 	"github.com/antono/hoodsniper/internal/monitor"
+	"github.com/antono/hoodsniper/internal/position"
 	"github.com/antono/hoodsniper/internal/shadow"
+	"github.com/antono/hoodsniper/internal/wallet"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // stateReadTimeout bounds the tier-1 batch. Past this the race is lost anyway,
@@ -71,13 +75,6 @@ func run() error {
 		logDst = lf
 	}
 	log := slog.New(slog.NewTextHandler(logDst, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	// Live execution is Phase 2. Refuse rather than silently shadow-trading
-	// while the operator believes real orders are going out.
-	if cfg.Live {
-		return fmt.Errorf("live: true is not supported yet — execution lands in Phase 2. " +
-			"Set live: false to run in shadow mode")
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -118,8 +115,45 @@ func run() error {
 	tradeSize := cfg.TradeSizeWei()
 	client := feed.NewClient(resolveFeed(cfg.Feed), cfg.ChainID, log)
 
-	log.Info("shadow mode — no transactions will be signed",
-		"watching", len(watch), "trade_size_eth", cfg.TradeSizeETH, "log", cfg.ShadowLog)
+	// Execution is armed only when live is set AND a key is present. Missing
+	// either falls back to shadow, loudly — never silently the other way.
+	var (
+		executor *exec.Executor
+		book     *position.Book
+	)
+	if cfg.Live {
+		signer, err := wallet.Load(cfg.ChainID)
+		if err != nil {
+			return fmt.Errorf("live: true but no usable signing key: %w", err)
+		}
+		raw, err := rpc.DialContext(ctx, cfg.RPC)
+		if err != nil {
+			return fmt.Errorf("dialing rpc for execution: %w", err)
+		}
+		defer raw.Close()
+
+		executor = exec.New(raw, signer, cfg.ExecConfig())
+		book = position.NewBook(cfg.ExitRules())
+		rules := cfg.ExitRules()
+
+		mode := "DRY RUN — trades simulated and signed, never broadcast"
+		if !cfg.IsDryRun() {
+			mode = "LIVE — real transactions will be broadcast"
+		}
+		log.Warn("execution armed", "mode", mode,
+			"address", signer.Address().Hex(),
+			"chain_id", cfg.ChainID,
+			"max_trade_eth", cfg.MaxTradeETH,
+			"daily_loss_limit_eth", cfg.DailyLossLimitETH,
+			"slippage_bps", cfg.SlippageBps,
+			"take_profit_pct", rules.TakeProfitPct,
+			"stop_loss_pct", rules.StopLossPct,
+			"max_hold", rules.MaxHold,
+			"follow_kol_sell", rules.FollowKOLSell)
+	} else {
+		log.Info("shadow mode — no transactions will be signed",
+			"watching", len(watch), "trade_size_eth", cfg.TradeSizeETH, "log", cfg.ShadowLog)
+	}
 
 	state := monitor.New(cfg.ShadowLog, cfg.Live, len(watch))
 	state.SetConfig(monitorConfig(*cfgPath, *ledgerPath, cfg))
@@ -170,8 +204,14 @@ func run() error {
 			// The state read blocks, so hand each match to its own goroutine:
 			// one slow token must not delay the next block's detection.
 			go evaluate(ctx, log, rpcClient, rec, cache, ladders, holds, holdRatio, holdSamples,
-				fcfg, tradeSize, b, tx, from, state, !*tui)
+				executor, book, fcfg, tradeSize, b, tx, from, state, !*tui)
 		}
+	}
+
+	// Price and time triggers need a clock of their own: they fire when nothing
+	// is happening, which is exactly when no feed event would wake them.
+	if executor != nil && book != nil {
+		go watchExits(ctx, log, executor, book, rpcClient, cache)
 	}
 
 	var runErr error
@@ -234,6 +274,18 @@ func run() error {
 			fmt.Printf("               calldata layout. Re-run `feedtap --discover` and re-verify.\n")
 		}
 	}
+	if book != nil {
+		openN, closed := book.Stats()
+		fmt.Printf("positions      %d open", openN)
+		for r, n := range closed {
+			fmt.Printf(", %d closed(%s)", n, r)
+		}
+		fmt.Println()
+		if openN > 0 {
+			fmt.Printf("WARNING        %d position(s) still open at shutdown — they are NOT\n", openN)
+			fmt.Printf("               closed automatically. Exit them manually.\n")
+		}
+	}
 	fmt.Printf("log            %s\n", cfg.ShadowLog)
 	return nil
 }
@@ -243,6 +295,7 @@ func evaluate(
 	ctx context.Context, log *slog.Logger, rpcClient *chain.Client,
 	rec *shadow.Recorder, cache *chain.Cache, ladders *ladder.Tracker,
 	holds *holdtime.Tracker, holdRatio float64, holdSamples int,
+	executor *exec.Executor, book *position.Book,
 	fcfg filter.Config, tradeSize *big.Int,
 	b feed.Block, tx *types.Transaction, from common.Address,
 	mon *monitor.State, echo bool,
@@ -272,6 +325,15 @@ func evaluate(
 	}
 	decodeHits.Add(1)
 	mon.ObserveDecode(true)
+
+	// Mirror an exit before any entry filtering. An exit must never be blocked
+	// by a gate designed to be selective about entries — being choosy about
+	// getting out is how a position becomes permanent.
+	if executor != nil && book != nil && intent.Direction == decode.DirectionSell {
+		if ex, ok := book.OnKOLSell(intent.Token()); ok {
+			closePosition(ctx, log, executor, book, rpcClient, cache, ex)
+		}
+	}
 
 	// Record the round trip regardless of what we decide. Gating a trade must
 	// not stop us learning how fast the wallet actually turns over, or the gate
@@ -350,6 +412,7 @@ func evaluate(
 		holds.ObserveLatency(detectLatency)
 	}
 
+	tokenState := state
 	record := shadow.Build(b.SeqNum, tx.Hash(), from, intent, state, decision,
 		tradeSize, detectLatency, time.Now(), lad.Clip, lad.LadderTotalWei)
 	if err := rec.Write(record); err != nil {
@@ -365,6 +428,111 @@ func evaluate(
 	if echo {
 		fmt.Println(record.Line())
 	}
+
+	// Only an approved entry reaches the executor. Everything above this line
+	// runs identically in shadow mode, so arming execution changes what happens
+	// after a decision, never how the decision is made.
+	if executor == nil || book == nil || !decision.Approved ||
+		intent.Direction != decode.DirectionBuy {
+		return
+	}
+	openPosition(ctx, log, executor, book, from, intent, tokenState, tradeSize)
+}
+
+// exitCheckInterval is how often open positions are re-valued. Each check costs
+// one simulated sell per position, so this trades RPC load against how late a
+// stop-loss can fire.
+const exitCheckInterval = 15 * time.Second
+
+// watchExits fires the price and time triggers. The KOL-sell trigger is handled
+// on the feed path instead, because it is driven by an event rather than a clock.
+func watchExits(ctx context.Context, log *slog.Logger, executor *exec.Executor,
+	book *position.Book, rpcClient *chain.Client, cache *chain.Cache) {
+
+	t := time.NewTicker(exitCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := time.Now()
+		for _, p := range book.Positions() {
+			st, err := rpcClient.FetchState(ctx, cache, p.Token)
+			if err != nil || st.Pool == nil {
+				continue
+			}
+			// A quote that errors means the sell cannot execute. Rather than
+			// treat that as "unchanged", it is passed through as an unknown
+			// value so the max-hold trigger can still rescue the position.
+			value, qErr := executor.QuoteSell(ctx, st.Pool, p.Token, p.Tokens)
+			if qErr != nil {
+				log.Warn("position cannot be quoted — possible honeypot",
+					"token", p.Token.Hex(), "err", qErr)
+				value = nil
+			}
+			if ex, ok := book.Check(p, value, now); ok {
+				log.Info("exit triggered", "token", p.Token.Hex(),
+					"reason", ex.Reason, "detail", ex.Detail, "pnl_pct", ex.PnLPct)
+				closePosition(ctx, log, executor, book, rpcClient, cache, ex)
+				if ex.ValueWei != nil && p.CostWei != nil {
+					executor.RecordPnL(new(big.Int).Sub(ex.ValueWei, p.CostWei))
+				}
+			}
+		}
+	}
+}
+
+// openPosition buys and books the result.
+func openPosition(ctx context.Context, log *slog.Logger, executor *exec.Executor,
+	book *position.Book, kol common.Address,
+	intent decode.SwapIntent, tokenState chain.TokenState, size *big.Int) {
+
+	if halted, why := executor.Halted(); halted {
+		log.Error("entry skipped, execution halted", "reason", why)
+		return
+	}
+	token := intent.Token()
+	res, err := executor.Buy(ctx, tokenState.Pool, token, size, nil)
+	if err != nil {
+		// A reverted simulation is the expected outcome for a honeypot, so this
+		// is information rather than a malfunction.
+		log.Warn("entry not executed", "token", token.Hex(), "reason", res.Reason, "err", err)
+		return
+	}
+	log.Info("entry executed", "token", token.Hex(), "tx", res.Hash.Hex(),
+		"amount_in", res.AmountIn, "min_out", res.MinOut, "sent", res.Sent,
+		"dry_run", !res.Sent)
+
+	book.Open(position.Position{
+		Token: token, KOL: kol, FeeTier: tokenState.Pool.FeeTier,
+		Pool: tokenState.Pool.Address, CostWei: res.AmountIn,
+		Tokens: res.MinOut, OpenedAt: time.Now(), EntryTx: res.Hash,
+	})
+}
+
+// closePosition sells and books the exit.
+func closePosition(ctx context.Context, log *slog.Logger, executor *exec.Executor,
+	book *position.Book, rpcClient *chain.Client, cache *chain.Cache, ex position.Exit) {
+
+	p := ex.Position
+	st, err := rpcClient.FetchState(ctx, cache, p.Token)
+	if err != nil || st.Pool == nil {
+		log.Error("exit blocked, cannot resolve pool", "token", p.Token.Hex(), "err", err)
+		return
+	}
+	res, err := executor.Sell(ctx, st.Pool, p.Token, p.Tokens, nil)
+	if err != nil {
+		// The position stays open on failure. Dropping it here would lose track
+		// of tokens we still hold.
+		log.Error("exit failed, position still open", "token", p.Token.Hex(),
+			"reason", ex.Reason, "err", err)
+		return
+	}
+	log.Info("exit executed", "token", p.Token.Hex(), "reason", ex.Reason,
+		"detail", ex.Detail, "tx", res.Hash.Hex(), "sent", res.Sent)
+	book.Close(p.Token, ex.Reason)
 }
 
 // cacheStats adapts the chain cache's counters for the monitor.
