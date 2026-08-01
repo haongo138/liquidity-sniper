@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/antono/hoodsniper/internal/filter"
+	"github.com/antono/hoodsniper/internal/holdtime"
 	"github.com/antono/hoodsniper/internal/ladder"
 	"github.com/ethereum/go-ethereum/common"
 	"gopkg.in/yaml.v3"
@@ -55,6 +56,8 @@ type FilterConfig struct {
 	MinTradeETH      float64  `yaml:"min_trade_eth"`
 	AllowSells       bool     `yaml:"allow_sells"`
 	LadderWindowSecs int      `yaml:"ladder_window_seconds"`
+	MinHoldRatio     float64  `yaml:"min_hold_ratio"`
+	MinHoldSamples   int      `yaml:"min_hold_samples"`
 	Blocklist        []string `yaml:"token_blocklist"`
 	Allowlist        []string `yaml:"token_allowlist"`
 }
@@ -116,6 +119,12 @@ func (c *Config) validate() error {
 		if c.DailyLossLimitETH <= 0 {
 			return fmt.Errorf("daily_loss_limit_eth must be set when live is true")
 		}
+	}
+	if c.Filters.MinHoldRatio < 0 {
+		return fmt.Errorf("min_hold_ratio cannot be negative")
+	}
+	if c.Filters.MinHoldSamples < 0 {
+		return fmt.Errorf("min_hold_samples cannot be negative")
 	}
 	if c.Filters.MinLPBurnedPct < 0 || c.Filters.MinLPBurnedPct > 100 {
 		return fmt.Errorf("min_lp_burned_pct must be within 0..100")
@@ -190,4 +199,25 @@ func (c Config) LadderWindow() time.Duration {
 	default:
 		return time.Duration(c.Filters.LadderWindowSecs) * time.Second
 	}
+}
+
+// HoldGate returns the hold-time gate settings.
+//
+// Unset means the default rather than disabled, for the same reason ladder
+// consolidation defaults on: copying a wallet you cannot keep up with is a
+// guaranteed loss, so opting out should be explicit. A negative ratio disables.
+func (c Config) HoldGate() (ratio float64, samples int) {
+	switch {
+	case c.Filters.MinHoldRatio < 0:
+		ratio = 0 // explicitly disabled
+	case c.Filters.MinHoldRatio == 0:
+		ratio = holdtime.DefaultMinRatio
+	default:
+		ratio = c.Filters.MinHoldRatio
+	}
+	samples = c.Filters.MinHoldSamples
+	if samples == 0 {
+		samples = holdtime.DefaultMinSamples
+	}
+	return ratio, samples
 }

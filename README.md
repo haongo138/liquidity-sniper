@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8.svg?logo=go&logoColor=white)](go.mod)
 [![Chain 4663](https://img.shields.io/badge/chain-Robinhood%204663-1ce783.svg)](https://docs.robinhood.com/chain/connecting)
-[![Tests 60](https://img.shields.io/badge/tests-60%20passing-brightgreen.svg)](#verification)
+[![Tests 73](https://img.shields.io/badge/tests-73%20passing-brightgreen.svg)](#verification)
 [![Execution: not armed](https://img.shields.io/badge/execution-not%20armed-orange.svg)](#status)
 
 Copy-trades KOL wallets on Robinhood Chain (EVM, chain 4663) by tapping the
@@ -176,6 +176,7 @@ reason in `shadow.jsonl`.
 | `token_blocklist` / `token_allowlist` | 0 | Free |
 | `allow_sells` | 0 | Direction gate |
 | `ladder_window_seconds` | 0 | Collapses a laddered entry into one signal (see below) |
+| `min_hold_ratio` / `min_hold_samples` | 0 | Skips wallets that trade faster than we can follow (see below) |
 | `min_trade_eth` | 0 | Ignores dust from the watched wallet |
 | `min_liquidity_eth` / `max_liquidity_eth` | 1 | ETH-side depth of the deepest pool across V2, V3 and V4 |
 | `require_lp_secured` + `min_lp_burned_pct` | 1 | **V2 only** — see below |
@@ -247,6 +248,45 @@ Cost: resolving candidates means testing several addresses against the pool
 registry, measured at **1250–1500ms** versus ~250ms for a direct Uniswap decode.
 The negative results are cached, so this improves as the cache warms, but it is
 another reason to co-locate.
+
+## Hold-time gate
+
+Copying a wallet you are structurally too slow to follow is a **guaranteed**
+loss, not a probabilistic one: if they are out in a second and detection alone
+costs two, the position is entered after the move and exited after the reversal,
+every time.
+
+Both halves of the comparison are measured, and neither is a constant:
+
+- **Their hold time**, per wallet, from observed buy→sell pairs. The two sampled
+  wallets had medians of **13s and 33s** — a single global threshold would be
+  wrong for both.
+- **Our latency**, from decisions that actually did the work. Measured p90 was
+  **1.9–2.7s**, dominated by round-trip distance, so it changes with deployment.
+
+Default floor is **5x**: we enter late by roughly our latency and exit late by
+the same, so a hold of N times our latency captures about (N−2)/N of the move.
+At 5x that is 60%, leaving room for the ~4% fee drag. Below 3x the arithmetic
+stops working.
+
+The gate is **per-trade, not per-wallet**. One sampled wallet had only 2 of 11
+trades under 3 seconds; excluding it outright would have discarded nine good
+signals to avoid two bad ones. It applies **only to entries** — declining an exit
+because the wallet trades fast would strand a position already opened.
+
+Live, with the tracker seeded from 46,852 ledger round trips:
+
+```
+median hold 28.487s is 15.1x our p90 latency 1.891s   → pass
+```
+
+**Seed it from the ledger.** Hold times can only be learned from completed round
+trips, so without seeding the gate is inert for hours. The daemon primes itself
+from `--ledger` at startup; run `cmd/collect` first and it works on the first
+decision.
+
+Below `min_hold_samples` the check reports **n/a**, never a pass — a gate that
+could not run must not look like one that approved.
 
 ## Ladder consolidation
 
@@ -339,7 +379,7 @@ V4_LIVE=1 go test ./internal/chain -run TestV4 -v
 ```bash
 go build ./...
 go vet ./...
-go test -race ./...        # 60 tests
+go test -race ./...        # 73 tests
 ```
 
 Coverage is weighted toward the things that fail silently:

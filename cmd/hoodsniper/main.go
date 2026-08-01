@@ -29,6 +29,7 @@ import (
 	"github.com/antono/hoodsniper/internal/decode"
 	"github.com/antono/hoodsniper/internal/feed"
 	"github.com/antono/hoodsniper/internal/filter"
+	"github.com/antono/hoodsniper/internal/holdtime"
 	"github.com/antono/hoodsniper/internal/ladder"
 	"github.com/antono/hoodsniper/internal/monitor"
 	"github.com/antono/hoodsniper/internal/shadow"
@@ -104,6 +105,15 @@ func run() error {
 	// same position pays the router's 1% fee five times, which alone exceeds
 	// the edge — see internal/ladder.
 	ladders := ladder.New(cfg.LadderWindow())
+	// Measures both their hold time and our latency, so the gate compares two
+	// observed numbers rather than a threshold pulled from the air.
+	holds := holdtime.New()
+	holdRatio, holdSamples := cfg.HoldGate()
+	// Prime from collected history. Without it the gate cannot judge anyone
+	// until three round trips have been watched live, which takes hours.
+	if rt, err := holds.SeedFromLedger(*ledgerPath); err == nil && rt > 0 {
+		log.Info("hold-time gate seeded", "round_trips", rt, "ledger", *ledgerPath)
+	}
 	fcfg := cfg.FilterConfig()
 	tradeSize := cfg.TradeSizeWei()
 	client := feed.NewClient(resolveFeed(cfg.Feed), cfg.ChainID, log)
@@ -159,7 +169,8 @@ func run() error {
 			state.ObserveMatch()
 			// The state read blocks, so hand each match to its own goroutine:
 			// one slow token must not delay the next block's detection.
-			go evaluate(ctx, log, rpcClient, rec, cache, ladders, fcfg, tradeSize, b, tx, from, state, !*tui)
+			go evaluate(ctx, log, rpcClient, rec, cache, ladders, holds, holdRatio, holdSamples,
+				fcfg, tradeSize, b, tx, from, state, !*tui)
 		}
 	}
 
@@ -200,6 +211,9 @@ func run() error {
 	fmt.Printf("rejected       %d\n", rejected)
 	hits, misses := cache.Stats()
 	fmt.Printf("profile cache  %d hits / %d misses\n", hits, misses)
+	if w, rt, ls := holds.Stats(); rt > 0 {
+		fmt.Printf("hold samples   %d round trips across %d wallets, %d latency samples\n", rt, w, ls)
+	}
 	if lad, sup := ladders.Stats(); lad > 0 || sup > 0 {
 		fmt.Printf("ladders        %d opened, %d clips suppressed", lad, sup)
 		if lad > 0 {
@@ -228,6 +242,7 @@ func run() error {
 func evaluate(
 	ctx context.Context, log *slog.Logger, rpcClient *chain.Client,
 	rec *shadow.Recorder, cache *chain.Cache, ladders *ladder.Tracker,
+	holds *holdtime.Tracker, holdRatio float64, holdSamples int,
 	fcfg filter.Config, tradeSize *big.Int,
 	b feed.Block, tx *types.Transaction, from common.Address,
 	mon *monitor.State, echo bool,
@@ -258,18 +273,50 @@ func evaluate(
 	decodeHits.Add(1)
 	mon.ObserveDecode(true)
 
+	// Record the round trip regardless of what we decide. Gating a trade must
+	// not stop us learning how fast the wallet actually turns over, or the gate
+	// would starve itself of the evidence it needs.
+	now := time.Now()
+	switch intent.Direction {
+	case decode.DirectionBuy:
+		holds.ObserveEntry(from, intent.Token(), now)
+	case decode.DirectionSell:
+		holds.ObserveExit(from, intent.Token(), now)
+	}
+
 	// Ladder consolidation runs after tier 0 and before the state read: a
 	// suppressed clip must still be recorded, but must not pay for an RPC
 	// round trip it will not act on.
 	t0 := filter.Tier0(fcfg, intent)
 	decision := t0
 
+	// The hold gate only applies to entries: declining to copy an exit because
+	// the wallet trades fast would strand a position we already opened.
+	var hv holdtime.Verdict
+	if t0.Approved && intent.Direction == decode.DirectionBuy {
+		hv = holds.Check(from, holdRatio, holdSamples)
+		// The check is always recorded, including when it cannot yet be
+		// evaluated. A gate that silently contributes nothing is
+		// indistinguishable from a gate that is broken.
+		check := filter.Check{Name: "hold_time", Verdict: filter.NotApplicable, Reason: hv.Reason()}
+		switch {
+		case hv.Applicable && hv.Pass:
+			check.Verdict = filter.Pass
+		case hv.Applicable:
+			check.Verdict = filter.Reject
+		}
+		decision = filter.Merge(t0, filter.Decision{
+			Approved: check.Verdict != filter.Reject,
+			Checks:   []filter.Check{check},
+		})
+	}
+
 	var lad ladder.Verdict
-	if t0.Approved {
+	if decision.Approved {
 		lad = ladders.Observe(from, intent.Token(), string(intent.Direction),
 			intent.AmountIn, time.Now())
 		if !lad.Act {
-			decision = filter.Merge(t0, filter.Decision{
+			decision = filter.Merge(decision, filter.Decision{
 				Approved: false,
 				Checks:   []filter.Check{{Name: "ladder", Verdict: filter.Reject, Reason: lad.Reason()}},
 			})
@@ -279,6 +326,7 @@ func evaluate(
 	// Only pay for the state read if tier 0 let it through and this is not a
 	// suppressed ladder clip. The bot-router path has already fetched it while
 	// resolving the token.
+	tradeablePath := decision.Approved
 	if decision.Approved {
 		if state.Token == (common.Address{}) {
 			state, err = rpcClient.FetchState(readCtx, cache, intent.Token())
@@ -290,8 +338,20 @@ func evaluate(
 		decision = filter.Merge(t0, filter.Tier1(fcfg, state))
 	}
 
+	// Record our latency only once the decision is complete. Sampling it at the
+	// top of this function captured decode time alone — ~340us rather than the
+	// ~250ms a real decision costs — which made the hold gate compare against a
+	// number three orders of magnitude too small and pass everything.
+	detectLatency := time.Since(b.ReceivedAt)
+	// Only decisions that walked the full path count towards our latency. A
+	// tier-0 or ladder rejection costs under a millisecond and never touches
+	// the network, so including it understates what a real trade would cost.
+	if tradeablePath {
+		holds.ObserveLatency(detectLatency)
+	}
+
 	record := shadow.Build(b.SeqNum, tx.Hash(), from, intent, state, decision,
-		tradeSize, time.Since(b.ReceivedAt), time.Now(), lad.Clip, lad.LadderTotalWei)
+		tradeSize, detectLatency, time.Now(), lad.Clip, lad.LadderTotalWei)
 	if err := rec.Write(record); err != nil {
 		log.Error("writing shadow record", "err", err)
 	}
@@ -331,6 +391,9 @@ func monitorConfig(path, ledger string, c config.Config) monitor.Config {
 			{Name: "allow_sells", Value: fmt.Sprintf("%t", f.AllowSells)},
 			{Name: "ladder_window_seconds", Value: fmt.Sprintf("%d", f.LadderWindowSecs),
 				Note: "0 = 60s default; collapses clip ladders"},
+			{Name: "min_hold_ratio", Value: fmt.Sprintf("%g", f.MinHoldRatio),
+				Note: "0 = 5x default; skips wallets too fast to follow"},
+			{Name: "min_hold_samples", Value: fmt.Sprintf("%d", f.MinHoldSamples)},
 			{Name: "token_blocklist", Value: fmt.Sprintf("%d entries", len(f.Blocklist))},
 			{Name: "token_allowlist", Value: fmt.Sprintf("%d entries", len(f.Allowlist))},
 		},

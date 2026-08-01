@@ -59,6 +59,12 @@ filters:
   # five clips would otherwise be mirrored five times, paying the router's 1%
   # fee on each. 0 = default (60s); negative disables.
   ladder_window_seconds: 0
+  # Skip entries from wallets that turn over faster than we can follow. Their
+  # median hold must exceed this multiple of our measured p90 latency.
+  # 0 = default (5x); negative disables. Needs min_hold_samples round trips
+  # before it can reject; seed them by running cmd/collect first.
+  min_hold_ratio: 0
+  min_hold_samples: 3
   token_blocklist: []
   token_allowlist: []
 
