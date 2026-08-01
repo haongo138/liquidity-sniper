@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8.svg?logo=go&logoColor=white)](go.mod)
 [![Chain 4663](https://img.shields.io/badge/chain-Robinhood%204663-1ce783.svg)](https://docs.robinhood.com/chain/connecting)
-[![Tests 50](https://img.shields.io/badge/tests-50%20passing-brightgreen.svg)](#verification)
+[![Tests 60](https://img.shields.io/badge/tests-60%20passing-brightgreen.svg)](#verification)
 [![Execution: not armed](https://img.shields.io/badge/execution-not%20armed-orange.svg)](#status)
 
 Copy-trades KOL wallets on Robinhood Chain (EVM, chain 4663) by tapping the
@@ -175,6 +175,7 @@ reason in `shadow.jsonl`.
 |---|---|---|
 | `token_blocklist` / `token_allowlist` | 0 | Free |
 | `allow_sells` | 0 | Direction gate |
+| `ladder_window_seconds` | 0 | Collapses a laddered entry into one signal (see below) |
 | `min_trade_eth` | 0 | Ignores dust from the watched wallet |
 | `min_liquidity_eth` / `max_liquidity_eth` | 1 | ETH-side depth of the deepest pool across V2, V3 and V4 |
 | `require_lp_secured` + `min_lp_burned_pct` | 1 | **V2 only** — see below |
@@ -247,6 +248,40 @@ registry, measured at **1250–1500ms** versus ~250ms for a direct Uniswap decod
 The negative results are cached, so this improves as the cache warms, but it is
 another reason to co-locate.
 
+## Ladder consolidation
+
+Watched wallets slice a position into equal clips. One observed entry was **five
+identical 0.03 ETH buys of the same token inside ~3 seconds**, totalling 0.15
+ETH. Mirroring each clip pays the bot router's 1% fee five times — roughly 5% on
+entry alone, before the pool fee and before the exit, which is more than the
+edge being chased.
+
+Waiting for the ladder to finish and then sizing up is not an option: detection
+is ~250ms warm and the ladder took ~3 seconds, so waiting trades away the entire
+timing advantage. Instead the **first clip acts and the rest are suppressed** —
+our position size is our own risk parameter, not a mirror of theirs.
+
+Measured over 150s against the 40 busiest wallets:
+
+```
+ladders 115 opened, 65 clips suppressed  (avoided 1.6x fee multiplication)
+```
+
+Suppressed clips cost **0.2–1.7ms** — they are rejected before the tier-1 state
+read, so a clip we will not act on never pays for a round trip. They are
+recorded in the shadow log with `ladder_clip` and the ladder's running total,
+never silently dropped: a signal that vanishes without explanation is
+indistinguishable from a bug.
+
+A **sell is never suppressed by a preceding buy** — direction is part of the
+key. Swallowing an exit would leave a position with no way out.
+
+`ladder_window_seconds` defaults to 60 (measured round trips were 97s and 142s,
+so a genuine re-entry falls outside it). Set it negative to disable, which is
+how the fee drag that would have been paid can be measured. Unset means the
+default rather than off, because silently mirroring every clip is the more
+expensive mistake.
+
 ## Uniswap V4 support
 
 V4 is a **singleton**: every pool lives inside one PoolManager, so there is no
@@ -304,7 +339,7 @@ V4_LIVE=1 go test ./internal/chain -run TestV4 -v
 ```bash
 go build ./...
 go vet ./...
-go test -race ./...        # 50 tests
+go test -race ./...        # 60 tests
 ```
 
 Coverage is weighted toward the things that fail silently:

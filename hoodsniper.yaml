@@ -55,6 +55,10 @@ filters:
   min_trade_eth: 0.0005
   # Copy exits as well as entries.
   allow_sells: false
+  # Collapse a laddered entry into one signal. A wallet slicing a position into
+  # five clips would otherwise be mirrored five times, paying the router's 1%
+  # fee on each. 0 = default (60s); negative disables.
+  ladder_window_seconds: 0
   token_blocklist: []
   token_allowlist: []
 

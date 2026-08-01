@@ -42,6 +42,12 @@ type Record struct {
 	// WouldTradeWei is what we would have spent copying it.
 	WouldTradeWei string `json:"would_trade_wei"`
 
+	// LadderClip is 1 for the clip that opened a ladder and higher for the
+	// suppressed ones. LadderTotalWei is what the wallet committed across the
+	// whole ladder, recorded even when we deliberately do not mirror it.
+	LadderClip     int    `json:"ladder_clip,omitempty"`
+	LadderTotalWei string `json:"ladder_total_wei,omitempty"`
+
 	Pool          string `json:"pool,omitempty"`
 	PoolFeeTier   uint32 `json:"pool_fee_tier,omitempty"`
 	PoolLiquidity string `json:"pool_liquidity_wei,omitempty"`
@@ -105,6 +111,7 @@ func Build(
 	seq uint64, txHash common.Hash, kol common.Address,
 	intent decode.SwapIntent, state chain.TokenState, dec filter.Decision,
 	wouldTrade *big.Int, detectLatency time.Duration, now time.Time,
+	ladderClip int, ladderTotal *big.Int,
 ) Record {
 	rec := Record{
 		At:              now,
@@ -120,6 +127,10 @@ func Build(
 		KOLAmountInWei:  bigStr(intent.AmountIn),
 		WouldTradeWei:   bigStr(wouldTrade),
 		Checks:          dec.Checks,
+		LadderClip:      ladderClip,
+	}
+	if ladderTotal != nil && ladderTotal.Sign() > 0 {
+		rec.LadderTotalWei = ladderTotal.String()
 	}
 	if state.Pool != nil {
 		rec.Pool = state.Pool.Address.Hex()

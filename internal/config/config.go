@@ -9,8 +9,10 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/antono/hoodsniper/internal/filter"
+	"github.com/antono/hoodsniper/internal/ladder"
 	"github.com/ethereum/go-ethereum/common"
 	"gopkg.in/yaml.v3"
 )
@@ -52,6 +54,7 @@ type FilterConfig struct {
 	RequireRenounced bool     `yaml:"require_renounced"`
 	MinTradeETH      float64  `yaml:"min_trade_eth"`
 	AllowSells       bool     `yaml:"allow_sells"`
+	LadderWindowSecs int      `yaml:"ladder_window_seconds"`
 	Blocklist        []string `yaml:"token_blocklist"`
 	Allowlist        []string `yaml:"token_allowlist"`
 }
@@ -169,4 +172,22 @@ func ethToWei(eth float64) *big.Int {
 	}
 	wei, _ := new(big.Float).Mul(big.NewFloat(eth), big.NewFloat(1e18)).Int(nil)
 	return wei
+}
+
+// LadderWindow is how long repeated same-token swaps from one wallet count as
+// one ladder. A wallet that slices an entry into five clips would otherwise be
+// mirrored five times, paying the router's 1% fee on each.
+//
+// Unset means the default rather than disabled: silently mirroring every clip
+// is the more expensive mistake, so disabling has to be asked for explicitly
+// with a negative value.
+func (c Config) LadderWindow() time.Duration {
+	switch {
+	case c.Filters.LadderWindowSecs < 0:
+		return 0 // explicitly disabled
+	case c.Filters.LadderWindowSecs == 0:
+		return ladder.DefaultWindow
+	default:
+		return time.Duration(c.Filters.LadderWindowSecs) * time.Second
+	}
 }
